@@ -1,0 +1,3 @@
+Once your program is compiled, the type signatures of functions should be included in the compiled binary, and you can use tools like ghc-pkg or haskell-docs to inspect the documentation and types of your compiled modules and functions.
+
+introspect types
