@@ -1,92 +1,215 @@
 module Main where
 
-import Codec.Picture
-import Debug.Trace
-import Linear.Metric
-import Linear.V2
-import Linear.V3
-import SDFs
-import Utils
+import SDL
+import Data.Text (pack)
+import Linear (V4(..))
+import Control.Monad (unless)
+import System.Random (randomRIO)
 
-scale = 4
 
-width = 1920 * scale
+data State = State { 
+    world_dims :: (Int, Int),
+    entities :: [Entity], 
+    input :: Input 
+}
+data Input = Input { left :: Bool, right :: Bool, up :: Bool, down :: Bool, action :: Bool }
+data Entity = Entity { 
+    pos :: (Float, Float),
+    vel :: (Float, Float),
+    acc :: (Float, Float),
+    size :: (Int, Int)
+}
 
-height = 1080 * scale
 
--- width = 480
+--------------------- UTILS -------------------
+-- clamp bounds of entity to world bounds
+clampEntity :: (Int, Int) -> Entity -> Entity
+clampEntity (w, h) entity = entity { pos = (x, y) }
+    where
+        x = max 0 (min (fromIntegral w) (fst (pos entity)))
+        y = max 0 (min (fromIntegral h) (snd (pos entity)))
 
--- height = 270
+-- move entity based on physics
+moveEntity :: Entity -> Entity
+moveEntity entity = entity { 
+    pos = (x + vx, y + vy),
+    vel = (vx + ax, vy + ay)
+}
+    where
+        (x, y) = pos entity
+        (vx, vy) = vel entity
+        (ax, ay) = acc entity
 
-res = V2 (fromIntegral width) (fromIntegral height)
+-- zero out acceleration
+zeroAcc :: Entity -> Entity
+zeroAcc entity = entity { acc = (0, 0) }
 
-circle :: V2 Double -> V2 Double -> Double -> V3 Double
-circle uv p r = V3 w w w
-  where
-    sdf = circleSDF uv p r
-    edge = 0.005
-    w = 1 - clamp 0 1 (1 - smoothstep (-edge) edge sdf)
 
-ics off d = 1 - clamp 0 1 (1 - smoothstep (-off) off d)
+-- gen random velocity
+genRandomVel :: IO (Float, Float)
+genRandomVel = do
+    let m = 0.02
+    x <- randomRIO (-m, m)
+    y <- randomRIO (-m, m)
+    return (x, y)
 
-genimage :: Int -> Int -> PixelRGB8
-genimage ix iy =
-  do
-    let coord = V2 (fromIntegral ix) (fromIntegral iy)
-    let x = fromIntegral ix
-    let y = fromIntegral iy
-    let aspectRatio = fromIntegral width / fromIntegral height
-    let uv = coord / V2 (fromIntegral width) (fromIntegral height) * V2 aspectRatio 1
+-- reverse entity velocity if touching a wall
+-- depends on the wall being touched
+-- if hit left wall, set vel to positive of current vel
+-- if hit right wall, set vel to negative of current vel
+-- same for y
+-- take in the resolution of the world
+bounceOnWalls :: Entity -> (Int, Int) -> Entity
+bounceOnWalls entity (w, h) = entity { vel = (vx', vy') }
+    where
+        (x, y) = pos entity
+        (vx, vy) = vel entity
+        (w', h') = size entity
+        vx' = if x <= 0 || x + fromIntegral w' >= fromIntegral w then -vx else vx
+        vy' = if y <= 0 || y + fromIntegral h' >= fromIntegral h then -vy else vy
 
-    -- Mickey Mouse head and ears
-    let headPos = 0.5
-    let earHeight = 0.25
-    let earCenterOffset = 0.15
-    let c1 = circleSDF uv (V2 (headPos * aspectRatio) 0.5) 0.25
-    let c2 = circleSDF uv (V2 ((headPos - earCenterOffset) * aspectRatio) earHeight) 0.15
-    let c3 = circleSDF uv (V2 ((headPos + earCenterOffset) * aspectRatio) earHeight) 0.15
 
-    -- Eyes
-    let eyeCentralOffset = 0.05
-    let eyeLevel = 0.45
-    let leftEyePos = V2 ((headPos - eyeCentralOffset) * aspectRatio) eyeLevel
-    let rightEyePos = V2 ((headPos + eyeCentralOffset) * aspectRatio) eyeLevel
-    let eyeWidth = 0.03
-    let eyeHeight = 0.065
-    let eye1 = ellipseSDF uv leftEyePos (V2 eyeWidth eyeHeight)
-    let eye2 = ellipseSDF uv rightEyePos (V2 eyeWidth eyeHeight)
 
-    -- Pupils
-    let pupilHeight = eyeLevel + 0.03
-    let pupilcWidth = 0.01
-    let pupilcHeight = 0.02
-    let pupil1 = ellipseSDF uv (V2 (0.45 * aspectRatio) pupilHeight) (V2 pupilcWidth pupilcHeight)
-    let pupil2 = ellipseSDF uv (V2 (0.55 * aspectRatio) pupilHeight) (V2 pupilcWidth pupilcHeight)
+--------------------- INITIALIZATION -------------------
+blankInput :: Input
+blankInput = Input { left = False, right = False, up = False, down = False, action = False }
 
-    -- Smile
-    let lowerMouth = ellipseSDF uv (V2 (0.5 * aspectRatio) 0.65) (V2 0.14 0.05)
-    let upperMouth = ellipseSDF uv (V2 (0.5 * aspectRatio) 0.62) (V2 0.13 0.05)
 
-    -- Combine shapes
-    let headRaw = c1 `min` c2 `min` c3
-    let head = ics 0.005 headRaw
-    let eyesRaw = eye1 `min` eye2
-    let eyes = ics 0.2 eyesRaw
-    let pupilsRaw = pupil1 `min` pupil2
-    let pupils = ics 1.4 pupilsRaw
-    let noseRaw = ellipseSDF uv (V2 (0.5 * aspectRatio) 0.57) (V2 0.08 0.035)
-    let nose = ics 0.09 noseRaw
-    let mouthRaw = lowerMouth `max` (-upperMouth)
-    let fullMouth = ics 0.1 mouthRaw
-    let face = head + eyes + pupils + nose + fullMouth
+-- Helper function to generate a single random entity
+makeRandomEntity :: (Int, Int) -> IO Entity
+makeRandomEntity (w, h) = do
+    size <- randomRIO (1, 3)
+    x <- randomRIO (0, w - size)
+    y <- randomRIO (0, h - size)
+    vel <- genRandomVel
+    return Entity { 
+        pos = (fromIntegral x, fromIntegral y),
+        vel = vel,
+        acc = (0, 0),
+        size = (size, size)
+    }
 
-    let w = face
-    let col = V3 w w w
+-- Generate n randomly positioned entities within bounds
+makeEntities :: (Int, Int) -> Int -> IO [Entity]
+makeEntities bounds n = sequence [makeRandomEntity bounds | _ <- [1..n]]
 
-    v3ToPixelRGB8 col
 
-image :: Image PixelRGB8
-image = generateImage genimage width height
+
+--------------------- INPUTS -------------------
+-- take in state, get inputs, return new state
+inputs :: State -> IO State
+inputs state = do
+    events <- pollEvents
+    let input = Input
+            { left = any (\event -> case eventPayload event of
+                KeyboardEvent keyboardEvent ->
+                    keyboardEventKeyMotion keyboardEvent == Pressed &&
+                    keysymKeycode (keyboardEventKeysym keyboardEvent) == KeycodeA
+                _ -> False) events
+            , right = any (\event -> case eventPayload event of
+                KeyboardEvent keyboardEvent ->
+                    keyboardEventKeyMotion keyboardEvent == Pressed &&
+                    keysymKeycode (keyboardEventKeysym keyboardEvent) == KeycodeD
+                _ -> False) events
+            , up = any (\event -> case eventPayload event of
+                KeyboardEvent keyboardEvent ->
+                    keyboardEventKeyMotion keyboardEvent == Pressed &&
+                    keysymKeycode (keyboardEventKeysym keyboardEvent) == KeycodeW
+                _ -> False) events
+            , down = any (\event -> case eventPayload event of
+                KeyboardEvent keyboardEvent ->
+                    keyboardEventKeyMotion keyboardEvent == Pressed &&
+                    keysymKeycode (keyboardEventKeysym keyboardEvent) == KeycodeS
+                _ -> False) events
+            , action = any (\event -> case eventPayload event of
+                KeyboardEvent keyboardEvent ->
+                    keyboardEventKeyMotion keyboardEvent == Pressed &&
+                    keysymKeycode (keyboardEventKeysym keyboardEvent) == KeycodeSpace
+                _ -> False) events
+            }
+    return state { input = input }
+
+
+--------------------- UPDATE -------------------
+step :: State -> IO State
+step state = do
+    -- let entities' = map moveEntity (entities state)
+
+    -- we want to move, then zero out acceleration, do bounce, then clamp position
+    let moved_entities = map (moveEntity . zeroAcc) (entities state)
+    let bounced_entities = map (\entity -> bounceOnWalls entity (world_dims state)) moved_entities
+    let next_entities = map (clampEntity (world_dims state)) bounced_entities
+    let newState = state { entities = next_entities }
+
+    return newState
+
+
+--------------------- DRAWING -------------------
+drawEntity :: Entity -> Renderer -> IO ()
+drawEntity entity renderer = do
+    rendererDrawColor renderer $= V4 255 255 255 255
+    let (x, y) = pos entity
+        (w, h) = size entity
+        -- Convert Int to CInt
+        rect = Rectangle (P (V2 (fromIntegral $ round x) (fromIntegral $ round y))) (V2 (fromIntegral w) (fromIntegral h))
+    fillRect renderer (Just rect)
+
+
+-- draw all the entities
+drawEntities :: State -> Renderer -> IO ()
+drawEntities state renderer = do
+    mapM_ (\entity -> drawEntity entity renderer) (entities state)
+
+
+draw :: State -> Renderer -> IO ()
+draw state renderer = do
+    drawEntities state renderer
+
+--------------------- MAIN LOOP -------------------
+appLoop :: State -> Renderer -> IO ()
+appLoop state renderer = do
+
+    -- poll for events
+    events <- pollEvents
+    let quitEvent event = case eventPayload event of
+            KeyboardEvent keyboardEvent ->
+                keyboardEventKeyMotion keyboardEvent == Pressed &&
+                keysymKeycode (keyboardEventKeysym keyboardEvent) == KeycodeQ ||
+                keysymKeycode (keyboardEventKeysym keyboardEvent) == KeycodeEscape
+            _ -> False
+        quit = any quitEvent events
+
+    state <- inputs state
+    state <- step state
+    
+    ---- DRAWING ----
+    rendererDrawColor renderer $= V4 0 0 0 255
+    clear renderer
+
+    draw state renderer
+
+    present renderer
+    unless quit (appLoop state renderer)
+
 
 main :: IO ()
-main = writePng "output.png" image
+main = do
+    initializeAll
+
+    let resolution = (640, 480)
+
+    window <- createWindow (pack "bouncing_shit") defaultWindow { windowInitialSize = V2 (fromIntegral (fst resolution)) (fromIntegral (snd resolution)) }
+    renderer <- createRenderer window (-1) defaultRenderer
+
+    let world_dims = resolution
+    entities <- makeEntities world_dims 32
+    let state = State { 
+        world_dims = world_dims,
+        entities = entities, 
+        input = blankInput 
+    }
+
+    appLoop state renderer
+
+    destroyWindow window
+    print "ok"
